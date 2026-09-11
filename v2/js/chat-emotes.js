@@ -1,6 +1,60 @@
 (function () {
   window.Chat = window.Chat || {};
 
+  function selectSevenTvImage(emote) {
+    var host = emote && emote.data && emote.data.host;
+    var files = host && Array.isArray(host.files) ? host.files : [];
+    var usable = files.filter(function (file) {
+      return file && typeof file.name === "string" && file.name.length > 0;
+    });
+
+    if (!host || typeof host.url !== "string" || !usable.length) return null;
+
+    function isAnimated(file) {
+      var frameCount = file.frame_count;
+      if (frameCount == null) frameCount = file.frameCount;
+      return Number(frameCount) > 1;
+    }
+
+    function isWebp(file) {
+      return (
+        typeof file.format === "string" &&
+        file.format.trim().toUpperCase() === "WEBP"
+      );
+    }
+
+    function pixelCount(file) {
+      var width = Number(file.width);
+      var height = Number(file.height);
+      if (!Number.isFinite(width) || width < 1) width = 0;
+      if (!Number.isFinite(height) || height < 1) height = 0;
+      return width * height;
+    }
+
+    function largest(candidates) {
+      return candidates.slice().sort(function (a, b) {
+        return pixelCount(b) - pixelCount(a);
+      })[0] || null;
+    }
+
+    var animated =
+      emote.animated === true ||
+      (emote.data && emote.data.animated === true) ||
+      usable.some(isAnimated);
+    var webp = usable.filter(isWebp);
+    var file = largest(
+      usable.filter(function (candidate) {
+        return animated && isAnimated(candidate) && isWebp(candidate);
+      }),
+    );
+
+    if (!file && animated) file = largest(usable.filter(isAnimated));
+    if (!file) file = largest(webp);
+    if (!file) file = largest(usable);
+
+    return file ? "https:" + host.url + "/" + file.name : null;
+  }
+
   $.extend(Chat, {
     loadGlobalEmotes: function () {
       if (Chat.info.globalEmotesStarted) return;
@@ -89,12 +143,12 @@
               !emote.data.host.files || !emote.data.host.files.length
             ) return;
 
-            var files = emote.data.host.files;
-            var file = files[files.length - 1];
+            var image = selectSevenTvImage(emote);
+            if (!image) return;
 
             Chat.info.emotes[emote.name] = {
               id: emote.id,
-              image: "https:" + emote.data.host.url + "/" + file.name,
+              image: image,
               zeroWidth: emote.data.flags === 256,
             };
           });
@@ -110,12 +164,12 @@
             !emote.data.host.files || !emote.data.host.files.length
           ) return;
 
-          var files = emote.data.host.files;
-          var file = files[files.length - 1];
+          var image = selectSevenTvImage(emote);
+          if (!image) return;
 
           Chat.info.emotes[emote.name] = {
             id: emote.id,
-            image: "https:" + emote.data.host.url + "/" + file.name,
+            image: image,
             zeroWidth: emote.data.flags === 256,
           };
         });
