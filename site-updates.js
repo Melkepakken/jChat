@@ -5,6 +5,13 @@ window.JCHAT_UPDATES = [
   {
     type: "update",
     date: "2026-09-12",
+    title: "7TV animation fix",
+    summary:
+      "Fixed an issue where some animated 7TV emotes could loop without their intended pause.",
+  },
+  {
+    type: "update",
+    date: "2026-09-12",
     title: "Smarter YouTube live discovery",
     summary:
       "jChat+ now avoids unnecessary repeated YouTube searches while still checking regularly for new live streams.",
