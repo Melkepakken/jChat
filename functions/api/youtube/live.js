@@ -1,13 +1,28 @@
 const YOUTUBE_API_ROOT = "https://www.googleapis.com/youtube/v3/";
-const YOUTUBE_RESOLVER_VERSION = "3";
+const YOUTUBE_RESOLVER_VERSION = "4";
 const YOUTUBE_API_TIMEOUT_MS = 15000;
 const MAX_UPLOADS = 50;
+const MAX_METADATA_BATCH_SIZE = 50;
+const MAX_PENDING_METADATA = 50;
+const MAX_RETAINED_CANDIDATES = 5;
+const MAX_PENDING_SEARCH_CANDIDATES = 5;
 const CACHE_VERSION = "v1";
 const GLOBAL_CACHE_KEY = "global";
 const OFFLINE_BACKOFF_MS = [60 * 1000, 120 * 1000, 300 * 1000];
+const SEARCH_BACKOFF_MS = [
+  6 * 60 * 60 * 1000,
+  12 * 60 * 60 * 1000,
+  24 * 60 * 60 * 1000,
+];
 const TEMPORARY_COOLDOWN_MS = 60 * 1000;
 const CONFIGURATION_COOLDOWN_MS = 5 * 60 * 1000;
 const PACIFIC_RESET_BUFFER_MS = 60 * 1000;
+// Keep verified ordinary upload metadata fresh for 30 minutes independently of
+// the uploads cache storage TTL. Candidate and unresolved entries are checked
+// on the cheap path.
+const ORDINARY_METADATA_REFRESH_MS = 30 * 60 * 1000;
+const RETAINED_CANDIDATE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const MAX_MISSING_METADATA_CHECKS = 3;
 const MAX_MEMORY_CACHE_ENTRIES = 256;
 const CACHE_TTL = {
   channel: 3 * 24 * 60 * 60,
@@ -15,7 +30,8 @@ const CACHE_TTL = {
   knownLive: 24 * 60 * 60,
   liveResult: 60,
   offlineState: 7 * 24 * 60 * 60,
-  searchMiss: 60 * 60,
+  uploadsState: 7 * 24 * 60 * 60,
+  searchState: 7 * 24 * 60 * 60,
   searchClientCooldown: 30 * 60,
 };
 const DAILY_QUOTA_REASONS = new Set([
@@ -41,6 +57,11 @@ const TEMPORARY_REASONS = new Set([
 const inFlightResolutions = new Map();
 const memoryCache = new Map();
 const warningDeadlines = new Map();
+const CHANNEL_KEYED_CACHE_KINDS = new Set([
+  "searchState",
+  "searchTemporary",
+  "uploadsState",
+]);
 
 function validRetryAfterMs(value) {
   return typeof value === "number" && Number.isFinite(value) && value > 0
@@ -228,13 +249,20 @@ async function fetchApi(path, params, apiKey, stage) {
   }
 }
 
-function responseItems(data, stage) {
+function responseItems(data, stage, options = {}) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     throw apiError(`${stage}-shape`, 200);
   }
 
   if (!Object.prototype.hasOwnProperty.call(data, "items")) {
-    return [];
+    if (
+      data.pageInfo?.totalResults === 0 ||
+      options.allowMissingItems === true
+    ) {
+      return [];
+    }
+
+    throw apiError(`${stage}-shape`, 200);
   }
 
   if (!Array.isArray(data.items)) {
@@ -368,15 +396,32 @@ function isTemporaryError(error) {
   );
 }
 
+function isChannelDiscoveryStage(stage) {
+  return /^(?:channels|playlistItems|videos)\.list(?:-(?:json|shape))?$/.test(
+    String(stage || ""),
+  );
+}
+
+function isSearchListStage(stage) {
+  return /^search\.list(?:-(?:json|shape))?$/.test(String(stage || ""));
+}
+
 function defaultCache() {
-  return globalThis.caches?.default || null;
+  try {
+    return globalThis.caches?.default || null;
+  } catch {
+    return null;
+  }
 }
 
 function cacheKey(context, kind, handle) {
   const url = new URL(context.request.url);
+  const cacheHandle = CHANNEL_KEYED_CACHE_KINDS.has(kind)
+    ? String(handle)
+    : String(handle).toLowerCase();
   url.pathname =
     `/__jchat-youtube-live-cache/${CACHE_VERSION}/${kind}/` +
-    encodeURIComponent(String(handle).toLowerCase());
+    encodeURIComponent(cacheHandle);
   url.search = "";
   url.hash = "";
   return new Request(url.toString(), { method: "GET" });
@@ -447,8 +492,22 @@ async function readCache(context, kind, handle) {
     const shared = await response.json();
     const sharedWrittenAt = Number(shared?._cachedAt || 0);
     const memoryWrittenAt = Number(inMemory?._cachedAt || 0);
+    const sharedResetAt = Number(shared?.resetAt || 0);
+    const memoryResetAt = Number(inMemory?.resetAt || 0);
+    const sharedResetIsNewer =
+      kind === "searchState" &&
+      Number.isFinite(sharedResetAt) &&
+      sharedResetAt > memoryResetAt;
+    const memoryResetIsNewer =
+      kind === "searchState" &&
+      Number.isFinite(memoryResetAt) &&
+      memoryResetAt > sharedResetAt;
 
-    if (inMemory !== null && memoryWrittenAt > sharedWrittenAt) {
+    if (
+      inMemory !== null &&
+      (memoryResetIsNewer ||
+        (memoryWrittenAt > sharedWrittenAt && !sharedResetIsNewer))
+    ) {
       return inMemory;
     }
 
@@ -584,12 +643,245 @@ function cachedCooldown(value) {
   };
 }
 
+function cachedSearchState(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Number.isFinite(value?._expiresAt) && value._expiresAt <= Date.now()) ||
+    !Number.isInteger(value.stage) ||
+    value.stage < 0 ||
+    value.stage > SEARCH_BACKOFF_MS.length ||
+    !Number.isFinite(value.nextSearchAt) ||
+    (value.lastSearchAt !== null &&
+      value.lastSearchAt !== undefined &&
+      !Number.isFinite(value.lastSearchAt)) ||
+    (value.resetAt !== null &&
+      value.resetAt !== undefined &&
+      (!Number.isFinite(value.resetAt) || value.resetAt < 0))
+  ) {
+    return null;
+  }
+
+  let pendingCandidates = [];
+
+  if (value.pendingCandidates !== undefined) {
+    if (
+      !Array.isArray(value.pendingCandidates) ||
+      value.pendingCandidates.length > MAX_PENDING_SEARCH_CANDIDATES
+    ) {
+      return null;
+    }
+
+    const parsedCandidates = value.pendingCandidates.map(cachedMetadataEntry);
+
+    if (
+      parsedCandidates.some(
+        (entry) =>
+          !entry ||
+          !["missing", "unknown", "upcoming"].includes(entry.state),
+      )
+    ) {
+      return null;
+    }
+
+    pendingCandidates = retainSearchCandidates(parsedCandidates);
+  }
+
+  return {
+    lastSearchAt:
+      value.lastSearchAt === null || value.lastSearchAt === undefined
+        ? null
+        : value.lastSearchAt,
+    nextSearchAt: value.nextSearchAt,
+    pendingCandidates,
+    resetAt:
+      value.resetAt === null || value.resetAt === undefined
+        ? null
+        : value.resetAt,
+    stage: value.stage,
+  };
+}
+
+function uploadFingerprint(videoIds) {
+  return videoIds.join(",");
+}
+
+function cachedMetadataEntry(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !isVideoId(value.videoId) ||
+    !["ordinary", "live", "upcoming", "unknown", "missing"].includes(
+      value.state,
+    ) ||
+    (value.scheduledStartTime !== null &&
+      value.scheduledStartTime !== undefined &&
+      typeof value.scheduledStartTime !== "string") ||
+    (value.actualStartTime !== null &&
+      value.actualStartTime !== undefined &&
+      typeof value.actualStartTime !== "string") ||
+    (value.actualEndTime !== null &&
+      value.actualEndTime !== undefined &&
+      typeof value.actualEndTime !== "string") ||
+    (value.verifiedAt !== null &&
+      value.verifiedAt !== undefined &&
+      (!Number.isFinite(value.verifiedAt) || value.verifiedAt < 0)) ||
+    (value.lastSeenAt !== null &&
+      value.lastSeenAt !== undefined &&
+      (!Number.isFinite(value.lastSeenAt) || value.lastSeenAt < 0)) ||
+    (value.missingChecks !== null &&
+      value.missingChecks !== undefined &&
+      (!Number.isInteger(value.missingChecks) || value.missingChecks < 0)) ||
+    (value.nextCheckAt !== null &&
+      value.nextCheckAt !== undefined &&
+      (!Number.isFinite(value.nextCheckAt) || value.nextCheckAt < 0))
+  ) {
+    return null;
+  }
+
+  return {
+    actualEndTime: value.actualEndTime || null,
+    actualStartTime: value.actualStartTime || null,
+    lastSeenAt: Number.isFinite(value.lastSeenAt) ? value.lastSeenAt : 0,
+    missingChecks: Number.isInteger(value.missingChecks)
+      ? Math.min(value.missingChecks, MAX_MISSING_METADATA_CHECKS)
+      : 0,
+    nextCheckAt: Number.isFinite(value.nextCheckAt)
+      ? value.nextCheckAt
+      : null,
+    scheduledStartTime: value.scheduledStartTime || null,
+    state: value.state,
+    videoId: value.videoId,
+    verifiedAt: Number.isFinite(value.verifiedAt) ? value.verifiedAt : 0,
+  };
+}
+
+function cachedCandidate(value) {
+  const candidate = cachedMetadataEntry(value);
+
+  return candidate && ["live", "upcoming"].includes(candidate.state)
+    ? candidate
+    : null;
+}
+
+function dedupeMetadata(entries) {
+  const seen = new Set();
+  const result = [];
+
+  for (const entry of entries) {
+    if (!entry || seen.has(entry.videoId)) {
+      continue;
+    }
+
+    seen.add(entry.videoId);
+    result.push(entry);
+  }
+
+  return result;
+}
+
+function cachedUploadsState(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    (Number.isFinite(value?._expiresAt) && value._expiresAt <= Date.now()) ||
+    !Array.isArray(value.uploadIds) ||
+    value.uploadIds.length > MAX_UPLOADS ||
+    value.uploadIds.some((videoId) => !isVideoId(videoId)) ||
+    typeof value.fingerprint !== "string" ||
+    value.fingerprint !== uploadFingerprint(value.uploadIds)
+  ) {
+    return null;
+  }
+
+  const now = Date.now();
+  let metadata;
+
+  if (Array.isArray(value.metadata)) {
+    if (value.metadata.length > MAX_UPLOADS + MAX_RETAINED_CANDIDATES) {
+      return null;
+    }
+
+    const parsed = value.metadata.map(cachedMetadataEntry);
+
+    if (parsed.some((entry) => !entry)) {
+      return null;
+    }
+
+    metadata = dedupeMetadata(parsed);
+  } else if (Array.isArray(value.candidates)) {
+    // Migrate the previous bounded candidate-only format safely. Uploads that
+    // were not candidates are unknown until their metadata is checked again.
+    if (value.candidates.length > MAX_RETAINED_CANDIDATES) {
+      return null;
+    }
+
+    const legacyCandidates = dedupeMetadata(
+      value.candidates.map(cachedCandidate).filter(Boolean),
+    );
+    const legacyById = new Map(
+      legacyCandidates.map((candidate) => [candidate.videoId, candidate]),
+    );
+
+    metadata = [
+      ...value.uploadIds.map(
+        (videoId) =>
+          legacyById.get(videoId) || {
+            actualEndTime: null,
+            actualStartTime: null,
+            lastSeenAt: now,
+            missingChecks: 0,
+            nextCheckAt: null,
+            scheduledStartTime: null,
+            state: "unknown",
+            videoId,
+            verifiedAt: 0,
+          },
+      ),
+      ...legacyCandidates.filter(
+        (candidate) => !value.uploadIds.includes(candidate.videoId),
+      ).map((candidate) => ({ ...candidate, lastSeenAt: now })),
+    ];
+  } else {
+    return null;
+  }
+
+  let pendingIds = [];
+
+  if (value.pendingIds !== undefined) {
+    if (
+      !Array.isArray(value.pendingIds) ||
+      value.pendingIds.length > MAX_PENDING_METADATA ||
+      value.pendingIds.some((videoId) => !isVideoId(videoId))
+    ) {
+      return null;
+    }
+
+    pendingIds = Array.from(new Set(value.pendingIds));
+  }
+
+  const candidates = metadata.filter((entry) =>
+    ["live", "upcoming"].includes(entry.state),
+  );
+
+  return {
+    candidates,
+    fingerprint: value.fingerprint,
+    metadata,
+    pendingIds,
+    uploadIds: [...value.uploadIds],
+  };
+}
+
 function cacheTtlUntil(deadline) {
   return Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
 }
 
-async function activeCooldown(context, kind) {
-  return cachedCooldown(await readCache(context, kind, GLOBAL_CACHE_KEY));
+async function activeCooldown(context, kind, cacheHandle = GLOBAL_CACHE_KEY) {
+  return cachedCooldown(await readCache(context, kind, cacheHandle));
 }
 
 async function activeGeneralCooldown(context) {
@@ -633,8 +925,13 @@ function cooldownPriority(code) {
   return code === "youtube_configuration_error" ? 2 : 1;
 }
 
-async function establishCooldown(context, kind, cooldown) {
-  const existing = await activeCooldown(context, kind);
+async function establishCooldown(
+  context,
+  kind,
+  cooldown,
+  cacheHandle = GLOBAL_CACHE_KEY,
+) {
+  const existing = await activeCooldown(context, kind, cacheHandle);
 
   if (
     existing &&
@@ -646,11 +943,112 @@ async function establishCooldown(context, kind, cooldown) {
   await writeCache(
     context,
     kind,
-    GLOBAL_CACHE_KEY,
+    cacheHandle,
     cooldown,
     cacheTtlUntil(cooldown.retryAt),
   );
   return cooldown;
+}
+
+function searchStateRecord(previous, overrides = {}) {
+  const readValue = (key, fallback) =>
+    Object.prototype.hasOwnProperty.call(overrides, key)
+      ? overrides[key]
+      : fallback;
+
+  return {
+    lastSearchAt: readValue("lastSearchAt", previous?.lastSearchAt ?? null),
+    nextSearchAt: readValue("nextSearchAt", previous?.nextSearchAt ?? 0),
+    pendingCandidates: retainSearchCandidates(
+      readValue("pendingCandidates", previous?.pendingCandidates || []),
+    ),
+    resetAt: readValue("resetAt", previous?.resetAt ?? null),
+    stage: readValue("stage", previous?.stage ?? 0),
+  };
+}
+
+async function saveSearchState(context, channelId, state) {
+  await writeCache(
+    context,
+    "searchState",
+    channelId,
+    state,
+    CACHE_TTL.searchState,
+  );
+  return state;
+}
+
+async function storeSearchMiss(
+  context,
+  channelId,
+  pendingCandidates = undefined,
+) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channelId),
+  );
+  const stage = Math.min((previous?.stage || 0) + 1, SEARCH_BACKOFF_MS.length);
+  const lastSearchAt = Date.now();
+  const state = searchStateRecord(previous, {
+    lastSearchAt,
+    nextSearchAt: lastSearchAt + SEARCH_BACKOFF_MS[stage - 1],
+    pendingCandidates:
+      pendingCandidates === undefined
+        ? previous?.pendingCandidates || []
+        : pendingCandidates,
+    // A miss advances within the current reset generation, not before it.
+    stage,
+  });
+
+  return saveSearchState(context, channelId, state);
+}
+
+async function clearSearchState(
+  context,
+  channelId,
+  pendingCandidates = undefined,
+) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channelId),
+  );
+  const now = Date.now();
+  const state = searchStateRecord(previous, {
+    lastSearchAt: null,
+    nextSearchAt: 0,
+    pendingCandidates:
+      pendingCandidates === undefined
+        ? previous?.pendingCandidates || []
+        : pendingCandidates,
+    resetAt: now,
+    stage: 0,
+  });
+
+  // A reset marker is deliberately written instead of relying on deletion.
+  // Cache API writes are still best-effort across isolates; this only gives
+  // readers a newer state to prefer when the shared cache is available.
+  return saveSearchState(context, channelId, state);
+}
+
+async function resetSearchBackoffOnActivity(context, channelId) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channelId),
+  );
+
+  if (!previous || previous.stage === 0) {
+    return previous;
+  }
+
+  const now = Date.now();
+  const state = searchStateRecord(previous, {
+    lastSearchAt: previous.lastSearchAt,
+    nextSearchAt: Math.min(
+      previous.nextSearchAt,
+      now + SEARCH_BACKOFF_MS[0],
+    ),
+    resetAt: now,
+    stage: 0,
+  });
+
+  return saveSearchState(context, channelId, state);
 }
 
 async function establishGeneralCooldown(context, cooldown) {
@@ -795,7 +1193,7 @@ async function latestUploadIds(uploadsPlaylistId, apiKey) {
         part: "contentDetails",
         playlistId: uploadsPlaylistId,
         maxResults: String(MAX_UPLOADS),
-        fields: "items(contentDetails/videoId)",
+        fields: "items(contentDetails/videoId),pageInfo(totalResults)",
       },
       apiKey,
       "playlistItems.list",
@@ -828,7 +1226,7 @@ async function searchLiveVideoIds(channelId, apiKey) {
         eventType: "live",
         type: "video",
         maxResults: "5",
-        fields: "items(id/videoId)",
+        fields: "items(id/videoId),pageInfo(totalResults)",
       },
       apiKey,
       "search.list",
@@ -856,54 +1254,87 @@ async function videosById(videoIds, apiKey) {
         id: videoIds.join(","),
         fields:
           "items(id,snippet(channelId,liveBroadcastContent)," +
-          "liveStreamingDetails(actualStartTime,actualEndTime))",
+          "liveStreamingDetails(scheduledStartTime,actualStartTime,actualEndTime))",
       },
       apiKey,
       "videos.list",
     ),
     "videos.list",
+    { allowMissingItems: true },
   );
 }
 
-function activeLiveVideoId(videoIds, videos, channelId) {
+function videoSnapshot(video, videoIds, channelId) {
   const requestedIds = new Set(videoIds);
-  const indexedVideos = new Map();
+  const content = video?.snippet?.liveBroadcastContent;
+  const details = video?.liveStreamingDetails;
 
-  for (const video of videos) {
-    const content = video?.snippet?.liveBroadcastContent;
-    const details = video?.liveStreamingDetails;
-
-    if (
-      !video ||
-      typeof video !== "object" ||
-      Array.isArray(video) ||
-      !isVideoId(video.id) ||
-      !requestedIds.has(video.id) ||
-      typeof video.snippet?.channelId !== "string" ||
-      !["live", "none", "upcoming"].includes(content) ||
-      (details != null &&
-        (typeof details !== "object" || Array.isArray(details))) ||
-      (details?.actualStartTime != null &&
-        typeof details.actualStartTime !== "string") ||
-      (details?.actualEndTime != null &&
-        typeof details.actualEndTime !== "string")
-    ) {
-      throw apiError("videos.list-shape", 200);
-    }
-
-    indexedVideos.set(video.id, video);
+  if (
+    !video ||
+    typeof video !== "object" ||
+    Array.isArray(video) ||
+    !isVideoId(video.id) ||
+    !requestedIds.has(video.id) ||
+    typeof video.snippet?.channelId !== "string" ||
+    !["live", "none", "upcoming"].includes(content) ||
+    (details != null &&
+      (typeof details !== "object" || Array.isArray(details))) ||
+    ["scheduledStartTime", "actualStartTime", "actualEndTime"].some(
+      (field) =>
+        details?.[field] != null && typeof details[field] !== "string",
+    )
+  ) {
+    throw apiError("videos.list-shape", 200);
   }
 
-  for (const videoId of videoIds) {
-    const video = indexedVideos.get(videoId);
-    const details = video?.liveStreamingDetails;
+  const snapshot = {
+    actualEndTime: details?.actualEndTime || null,
+    actualStartTime: details?.actualStartTime || null,
+    scheduledStartTime: details?.scheduledStartTime || null,
+    state: "unknown",
+    videoId: video.id,
+  };
 
-    if (
-      video?.snippet?.channelId === channelId &&
-      video.snippet.liveBroadcastContent === "live" &&
-      details?.actualStartTime &&
-      !details.actualEndTime
-    ) {
+  if (video.snippet.channelId !== channelId) {
+    return snapshot;
+  }
+
+  if (
+    content === "live" &&
+    details?.actualStartTime &&
+    !details.actualEndTime
+  ) {
+    snapshot.state = "live";
+  } else if (content === "upcoming") {
+    snapshot.state = "upcoming";
+  } else if (
+    content === "none" &&
+    (details?.actualEndTime ||
+      (!details?.scheduledStartTime && !details?.actualStartTime))
+  ) {
+    // Conflicting broadcast hints without an end marker need another check.
+    snapshot.state = "ordinary";
+  }
+
+  return snapshot;
+}
+
+function videoSnapshots(videoIds, videos, channelId) {
+  const snapshots = new Map();
+
+  for (const video of videos) {
+    const snapshot = videoSnapshot(video, videoIds, channelId);
+    snapshots.set(snapshot.videoId, snapshot);
+  }
+
+  return snapshots;
+}
+
+function activeLiveVideoId(videoIds, videos, channelId) {
+  const snapshots = videoSnapshots(videoIds, videos, channelId);
+
+  for (const videoId of videoIds) {
+    if (snapshots.get(videoId)?.state === "live") {
       return videoId;
     }
   }
@@ -977,17 +1408,630 @@ async function storeOfflineResult(context, handle) {
   return offlineResult(nextCheckAt);
 }
 
+function candidateSignature(metadata) {
+  if (!metadata) {
+    return "";
+  }
+
+  if (metadata.state === "ordinary") {
+    return "ordinary";
+  }
+
+  return [
+    metadata.state,
+    metadata.scheduledStartTime || "",
+    metadata.actualStartTime || "",
+    metadata.actualEndTime || "",
+  ].join("|");
+}
+
+function metadataMap(metadata) {
+  return new Map(metadata.map((entry) => [entry.videoId, entry]));
+}
+
+function isRetainedMetadata(entry, currentIds, now) {
+  return (
+    !currentIds.has(entry.videoId) &&
+    ["live", "upcoming", "unknown", "missing"].includes(entry.state) &&
+    (entry.state !== "missing" ||
+      entry.missingChecks < MAX_MISSING_METADATA_CHECKS) &&
+    Number.isFinite(entry.lastSeenAt) &&
+    now - entry.lastSeenAt <= RETAINED_CANDIDATE_MAX_AGE_MS
+  );
+}
+
+function metadataIsDue(entry, now) {
+  if (!entry || ["live", "upcoming", "unknown"].includes(entry.state)) {
+    return true;
+  }
+
+  if (entry.state === "missing") {
+    return (
+      entry.missingChecks < MAX_MISSING_METADATA_CHECKS ||
+      !Number.isFinite(entry.nextCheckAt) ||
+      entry.nextCheckAt <= now
+    );
+  }
+
+  return (
+    !Number.isFinite(entry.verifiedAt) ||
+    entry.verifiedAt + ORDINARY_METADATA_REFRESH_MS <= now
+  );
+}
+
+function unknownMetadata(videoId, now) {
+  return {
+    actualEndTime: null,
+    actualStartTime: null,
+    lastSeenAt: now,
+    missingChecks: 0,
+    nextCheckAt: null,
+    scheduledStartTime: null,
+    state: "unknown",
+    videoId,
+    verifiedAt: 0,
+  };
+}
+
+function isSearchCandidateState(entry) {
+  return Boolean(
+    entry && ["missing", "unknown", "upcoming"].includes(entry.state),
+  );
+}
+
+function retainSearchCandidates(entries, now = Date.now()) {
+  if (!Array.isArray(entries)) {
+    return [];
+  }
+
+  return dedupeMetadata(entries)
+    .filter(
+      (entry) =>
+        isSearchCandidateState(entry) &&
+        Number.isFinite(entry.lastSeenAt) &&
+        now - entry.lastSeenAt <= RETAINED_CANDIDATE_MAX_AGE_MS,
+    )
+    .slice(0, MAX_PENDING_SEARCH_CANDIDATES);
+}
+
+function searchCandidateIsDue(entry, now) {
+  if (!entry) {
+    return false;
+  }
+
+  if (Number.isFinite(entry.nextCheckAt) && entry.nextCheckAt > now) {
+    return false;
+  }
+
+  return metadataIsDue(entry, now);
+}
+
+function pendingSearchCandidate(videoId, previous, now) {
+  const priorLastSeenAt = Number.isFinite(previous?.lastSeenAt)
+    ? previous.lastSeenAt
+    : now;
+
+  return {
+    ...unknownMetadata(videoId, now),
+    lastSeenAt: priorLastSeenAt || now,
+    nextCheckAt: now + OFFLINE_BACKOFF_MS[0],
+  };
+}
+
+function searchCandidateFromSnapshot(snapshot, previous, now) {
+  const priorLastSeenAt = Number.isFinite(previous?.lastSeenAt)
+    ? previous.lastSeenAt
+    : now;
+
+  return {
+    ...snapshot,
+    lastSeenAt: priorLastSeenAt || now,
+    missingChecks: 0,
+    nextCheckAt: now + OFFLINE_BACKOFF_MS[0],
+    verifiedAt: now,
+  };
+}
+
+function searchMissingCandidate(videoId, previous, now) {
+  const missingChecks = Math.min(
+    (previous?.missingChecks || 0) + 1,
+    MAX_MISSING_METADATA_CHECKS,
+  );
+  const priorLastSeenAt = Number.isFinite(previous?.lastSeenAt)
+    ? previous.lastSeenAt
+    : now;
+
+  return {
+    actualEndTime: null,
+    actualStartTime: null,
+    lastSeenAt: priorLastSeenAt || now,
+    missingChecks,
+    nextCheckAt:
+      now +
+      (missingChecks >= MAX_MISSING_METADATA_CHECKS
+        ? ORDINARY_METADATA_REFRESH_MS
+        : OFFLINE_BACKOFF_MS[0]),
+    scheduledStartTime: null,
+    state: "missing",
+    videoId,
+    verifiedAt: now,
+  };
+}
+
+function mergeSearchCandidates(
+  previousCandidates,
+  incomingCandidates,
+  discardedIds = new Set(),
+  now = Date.now(),
+) {
+  const byId = new Map();
+
+  for (const entry of [...(previousCandidates || []), ...(incomingCandidates || [])]) {
+    if (
+      entry &&
+      !discardedIds.has(entry.videoId) &&
+      isSearchCandidateState(entry)
+    ) {
+      byId.set(entry.videoId, entry);
+    }
+  }
+
+  return retainSearchCandidates(Array.from(byId.values()), now);
+}
+
+function inspectSearchMetadata(
+  videoIds,
+  videos,
+  channelId,
+  previousCandidates = [],
+  now = Date.now(),
+) {
+  const snapshots = videoSnapshots(videoIds, videos, channelId);
+  const videosById = new Map(videos.map((video) => [video.id, video]));
+  const previousById = metadataMap(previousCandidates);
+  const incomingCandidates = [];
+  const discardedIds = new Set();
+  let candidateVideoId = null;
+
+  for (const videoId of videoIds) {
+    const video = videosById.get(videoId);
+
+    if (!video) {
+      incomingCandidates.push(
+        searchMissingCandidate(videoId, previousById.get(videoId), now),
+      );
+      continue;
+    }
+
+    // videoSnapshot deliberately treats ownership mismatch as unknown for
+    // callers that need to remain conservative. Search candidates have a
+    // stronger discard rule: a returned, different-channel owner is final.
+    if (video.snippet.channelId !== channelId) {
+      discardedIds.add(videoId);
+      continue;
+    }
+
+    const snapshot = snapshots.get(videoId);
+
+    if (snapshot?.state === "live") {
+      candidateVideoId ||= videoId;
+      discardedIds.add(videoId);
+    } else if (snapshot?.state === "ordinary") {
+      discardedIds.add(videoId);
+    } else if (snapshot) {
+      incomingCandidates.push(
+        searchCandidateFromSnapshot(
+          snapshot,
+          previousById.get(videoId),
+          now,
+        ),
+      );
+    }
+  }
+
+  return {
+    candidateVideoId,
+    pendingCandidates: mergeSearchCandidates(
+      previousCandidates.filter((entry) => !videoIds.includes(entry.videoId)),
+      incomingCandidates,
+      discardedIds,
+      now,
+    ),
+    videosVerified: snapshots.size,
+  };
+}
+
+async function retainSearchCandidatesForRetry(
+  context,
+  channelId,
+  videoIds,
+  options = {},
+) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channelId),
+  );
+  const now = Date.now();
+  const previousCandidates = previous?.pendingCandidates || [];
+  const previousById = metadataMap(previousCandidates);
+  const incomingCandidates = Array.from(new Set(videoIds)).map((videoId) =>
+    pendingSearchCandidate(videoId, previousById.get(videoId), now),
+  );
+  const stage = options.advanceStage
+    ? Math.max(previous?.stage || 0, 1)
+    : previous?.stage || 0;
+  const deadlineStage = Math.max(stage, 1);
+  const nextSearchAt = Math.max(
+    previous?.nextSearchAt || 0,
+    now + SEARCH_BACKOFF_MS[deadlineStage - 1],
+  );
+  const state = searchStateRecord(previous, {
+    lastSearchAt:
+      options.searchAttempted === true
+        ? now
+        : previous?.lastSearchAt ?? null,
+    nextSearchAt,
+    pendingCandidates: mergeSearchCandidates(
+      // Keep the just-observed IDs if the bounded pending set is already full.
+      incomingCandidates,
+      previousCandidates.filter((entry) => !videoIds.includes(entry.videoId)),
+      new Set(),
+      now,
+    ),
+    stage,
+  });
+
+  return saveSearchState(context, channelId, state);
+}
+
+async function removeSearchCandidate(context, channelId, videoId) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channelId),
+  );
+
+  if (!previous?.pendingCandidates.some((entry) => entry.videoId === videoId)) {
+    return previous;
+  }
+
+  return saveSearchState(
+    context,
+    channelId,
+    searchStateRecord(previous, {
+      pendingCandidates: previous.pendingCandidates.filter(
+        (entry) => entry.videoId !== videoId,
+      ),
+    }),
+  );
+}
+
+async function inspectPendingSearchCandidates(
+  context,
+  channel,
+  apiKey,
+  excludedIds = [],
+) {
+  const previous = cachedSearchState(
+    await readCache(context, "searchState", channel.channelId),
+  );
+
+  if (!previous) {
+    return { candidateVideoId: null, videosVerified: 0 };
+  }
+
+  const now = Date.now();
+  const retainedCandidates = retainSearchCandidates(
+    previous.pendingCandidates,
+    now,
+  );
+  const excluded = new Set(excludedIds);
+  const dueCandidates = retainedCandidates
+    .filter(
+      (entry) =>
+        !excluded.has(entry.videoId) && searchCandidateIsDue(entry, now),
+    )
+    .slice(0, MAX_PENDING_SEARCH_CANDIDATES);
+
+  if (!dueCandidates.length) {
+    if (retainedCandidates.length !== previous.pendingCandidates.length) {
+      await saveSearchState(
+        context,
+        channel.channelId,
+        searchStateRecord(previous, { pendingCandidates: retainedCandidates }),
+      );
+    }
+
+    return { candidateVideoId: null, videosVerified: 0 };
+  }
+
+  const videoIds = dueCandidates.map((entry) => entry.videoId);
+  const videos = await videosById(videoIds, apiKey);
+  const inspection = inspectSearchMetadata(
+    videoIds,
+    videos,
+    channel.channelId,
+    retainedCandidates,
+    now,
+  );
+
+  await saveSearchState(
+    context,
+    channel.channelId,
+    searchStateRecord(previous, {
+      pendingCandidates: inspection.pendingCandidates,
+    }),
+  );
+
+  if (inspection.candidateVideoId) {
+    await clearSearchState(
+      context,
+      channel.channelId,
+      inspection.pendingCandidates,
+    );
+  }
+
+  return inspection;
+}
+
+async function inspectUploads(context, channel, apiKey) {
+  const uploadIds = await latestUploadIds(channel.uploadsPlaylistId, apiKey);
+  const previous = cachedUploadsState(
+    await readCache(context, "uploadsState", channel.channelId),
+  );
+  const now = Date.now();
+  const fingerprint = uploadFingerprint(uploadIds);
+  const uploadsChanged = !previous || previous.fingerprint !== fingerprint;
+  const previousIds = new Set(previous?.uploadIds || []);
+  const currentIds = new Set(uploadIds);
+  const previousMetadata = previous?.metadata || [];
+  const previousMetadataById = metadataMap(previousMetadata);
+  const metadataById = new Map(previousMetadataById);
+
+  for (const videoId of uploadIds) {
+    const previousEntry = metadataById.get(videoId);
+    metadataById.set(
+      videoId,
+      previousEntry
+        ? { ...previousEntry, lastSeenAt: now }
+        : unknownMetadata(videoId, now),
+    );
+  }
+
+  const newUploadIds = uploadIds.filter((videoId) => !previousIds.has(videoId));
+  const retainedIds = new Set(
+    previousMetadata
+      .filter((entry) => isRetainedMetadata(entry, currentIds, now))
+      .map((entry) => entry.videoId),
+  );
+  const eligibleIds = new Set([...currentIds, ...retainedIds]);
+  const pendingIds = previous?.pendingIds || [];
+  const missingMetadataIds = uploadIds.filter(
+    (videoId) => !previousMetadataById.has(videoId),
+  );
+  const candidateIds = previousMetadata
+    .filter(
+      (entry) =>
+        ["live", "upcoming", "unknown", "missing"].includes(entry.state) &&
+        metadataIsDue(entry, now),
+    )
+    .map((entry) => entry.videoId);
+  const dueOrdinaryIds = previousMetadata
+    .filter((entry) => entry.state === "ordinary" && metadataIsDue(entry, now))
+    .map((entry) => entry.videoId);
+  const forcedIds = new Set([
+    ...newUploadIds,
+    ...pendingIds,
+    ...missingMetadataIds,
+  ]);
+  const orderedMetadataIds = previous
+    ? [
+        // Deferred work must precede candidates that are due on every check.
+        ...pendingIds,
+        ...newUploadIds,
+        ...candidateIds,
+        ...missingMetadataIds,
+        ...dueOrdinaryIds,
+      ]
+    : uploadIds;
+  const metadataIds = Array.from(new Set(orderedMetadataIds)).filter(
+    (videoId) =>
+      eligibleIds.has(videoId) &&
+      (forcedIds.has(videoId) || metadataIsDue(metadataById.get(videoId), now)),
+  );
+  const videoIdsToVerify = metadataIds.slice(0, MAX_METADATA_BATCH_SIZE);
+  const deferredMetadataIds = metadataIds.slice(
+    MAX_METADATA_BATCH_SIZE,
+    MAX_METADATA_BATCH_SIZE + MAX_PENDING_METADATA,
+  );
+  const videos = videoIdsToVerify.length
+    ? await videosById(videoIdsToVerify, apiKey)
+    : [];
+  const snapshots = videoSnapshots(
+    videoIdsToVerify,
+    videos,
+    channel.channelId,
+  );
+
+  for (const videoId of videoIdsToVerify) {
+    const snapshot = snapshots.get(videoId);
+    const previousEntry = metadataById.get(videoId);
+
+    if (snapshot) {
+      metadataById.set(videoId, {
+        ...snapshot,
+        lastSeenAt: currentIds.has(videoId)
+          ? now
+          : previousEntry?.lastSeenAt || now,
+        missingChecks: 0,
+        nextCheckAt: null,
+        verifiedAt: now,
+      });
+      continue;
+    }
+
+    const missingChecks = Math.min(
+      (previousEntry?.missingChecks || 0) + 1,
+      MAX_MISSING_METADATA_CHECKS,
+    );
+    metadataById.set(videoId, {
+      actualEndTime: null,
+      actualStartTime: null,
+      lastSeenAt: currentIds.has(videoId)
+        ? now
+        : previousEntry?.lastSeenAt || now,
+      missingChecks,
+      nextCheckAt:
+        missingChecks >= MAX_MISSING_METADATA_CHECKS
+          ? now + ORDINARY_METADATA_REFRESH_MS
+          : null,
+      scheduledStartTime: null,
+      state: "missing",
+      videoId,
+      verifiedAt: now,
+    });
+  }
+
+  const currentMetadata = uploadIds.map((videoId) => metadataById.get(videoId));
+  const retainedMetadata = Array.from(metadataById.values())
+    .filter((entry) => isRetainedMetadata(entry, currentIds, now))
+    .sort((first, second) => second.lastSeenAt - first.lastSeenAt)
+    .slice(0, MAX_RETAINED_CANDIDATES);
+  const metadata = dedupeMetadata([...currentMetadata, ...retainedMetadata]);
+  const candidates = metadata.filter((entry) =>
+    ["live", "upcoming"].includes(entry.state),
+  );
+  const previousMetadataMap = metadataMap(previousMetadata);
+  const nextMetadataMap = metadataMap(metadata);
+  const metadataIdsToCompare = new Set([
+    ...previousMetadataMap.keys(),
+    ...nextMetadataMap.keys(),
+  ]);
+  const candidateChanged = Array.from(metadataIdsToCompare).some(
+    (videoId) =>
+      candidateSignature(previousMetadataMap.get(videoId)) !==
+      candidateSignature(nextMetadataMap.get(videoId)),
+  );
+  const upcomingCandidateChecked =
+    videoIdsToVerify.some(
+      (videoId) => previousMetadataMap.get(videoId)?.state === "upcoming",
+    ) ||
+    Array.from(snapshots.values()).some(
+      (snapshot) => snapshot.state === "upcoming",
+    );
+  let candidateVideoId = null;
+
+  for (const videoId of videoIdsToVerify) {
+    if (snapshots.get(videoId)?.state === "live") {
+      candidateVideoId = videoId;
+      break;
+    }
+  }
+
+  await writeCache(
+    context,
+    "uploadsState",
+    channel.channelId,
+    {
+      candidates,
+      fingerprint,
+      metadata,
+      pendingIds: deferredMetadataIds.filter((videoId) =>
+        metadata.some((entry) => entry.videoId === videoId),
+      ),
+      uploadIds,
+    },
+    CACHE_TTL.uploadsState,
+  );
+
+  return {
+    activityDetected: Boolean(
+      previous && (uploadsChanged || candidateChanged),
+    ),
+    candidateChanged,
+    candidateVideoId,
+    upcomingCandidateChecked,
+    uploadsChanged,
+    uploadsChecked: uploadIds.length,
+    videosVerified: snapshots.size,
+  };
+}
+
+async function resolveFromUploadsForChannel(
+  context,
+  handle,
+  apiKey,
+  channel,
+  source,
+  searchDetails,
+  options = {},
+) {
+  const inspection = await inspectUploads(context, channel, apiKey);
+  const pendingInspection = inspection.candidateVideoId
+    ? { candidateVideoId: null, videosVerified: 0 }
+    : await inspectPendingSearchCandidates(
+        context,
+        channel,
+        apiKey,
+        options.skipSearchCandidateIds || [],
+      );
+  const candidateVideoId =
+    inspection.candidateVideoId || pendingInspection.candidateVideoId;
+  const activitySearchState = inspection.activityDetected
+    ? await resetSearchBackoffOnActivity(context, channel.channelId)
+    : null;
+  const resultDetails = {
+    ...searchDetails,
+    ...(activitySearchState
+      ? {
+          nextSearchAt: activitySearchState.nextSearchAt,
+          searchBackoffStage: activitySearchState.stage,
+      }
+      : {}),
+    channelId: channel.channelId,
+    candidateVideoId,
+    liveCandidateFound: Boolean(candidateVideoId),
+    upcomingCandidateChecked: inspection.upcomingCandidateChecked,
+    uploadsChanged: inspection.uploadsChanged,
+    uploadsChecked: inspection.uploadsChecked,
+    videosVerified:
+      inspection.videosVerified + pendingInspection.videosVerified,
+  };
+
+  if (candidateVideoId) {
+    const result = await storeLiveResult(
+      context,
+      handle,
+      candidateVideoId,
+    );
+    logResult(context, source, result, resultDetails);
+    return result;
+  }
+
+  const result = await storeOfflineResult(context, handle);
+  logResult(context, source, result, {
+    ...resultDetails,
+    liveCandidateFound: false,
+  });
+  return result;
+}
+
 async function resolveFromUploads(
   context,
   handle,
   apiKey,
   channel,
   source = "uploads-playlist",
+  searchDetails = {},
+  options = {},
 ) {
-  let videoIds;
-
   try {
-    videoIds = await latestUploadIds(channel.uploadsPlaylistId, apiKey);
+    return await resolveFromUploadsForChannel(
+      context,
+      handle,
+      apiKey,
+      channel,
+      source,
+      searchDetails,
+      options,
+    );
   } catch (error) {
     if (!isMissingUploadsPlaylist(error)) {
       throw error;
@@ -997,7 +2041,15 @@ async function resolveFromUploads(
     channel = await resolveChannel(context, handle, apiKey, true);
 
     try {
-      videoIds = await latestUploadIds(channel.uploadsPlaylistId, apiKey);
+      return await resolveFromUploadsForChannel(
+        context,
+        handle,
+        apiKey,
+        channel,
+        source,
+        searchDetails,
+        options,
+      );
     } catch (freshError) {
       if (isMissingUploadsPlaylist(freshError)) {
         throw channelUnavailableError("playlistItems.list", "playlistNotFound");
@@ -1006,22 +2058,6 @@ async function resolveFromUploads(
       throw freshError;
     }
   }
-
-  const videoId = activeLiveVideoId(
-    videoIds,
-    await videosById(videoIds, apiKey),
-    channel.channelId,
-  );
-
-  if (videoId) {
-    const result = await storeLiveResult(context, handle, videoId);
-    logResult(context, source, result, { uploadsChecked: videoIds.length });
-    return result;
-  }
-
-  const result = await storeOfflineResult(context, handle);
-  logResult(context, source, result, { uploadsChecked: videoIds.length });
-  return result;
 }
 
 async function resolveLiveVideo(context, handle, apiKey) {
@@ -1060,6 +2096,14 @@ async function resolveLiveVideo(context, handle, apiKey) {
     throwCooldown(generalCooldown);
   }
 
+  const channelCooldown = cachedCooldown(
+    await readCache(context, "channelTemporaryCooldown", handle),
+  );
+
+  if (channelCooldown) {
+    throwCooldown(channelCooldown);
+  }
+
   if (!apiKey) {
     throw configurationError("configuration");
   }
@@ -1070,18 +2114,75 @@ async function resolveLiveVideo(context, handle, apiKey) {
   const knownVideoId = isVideoId(knownLive?.videoId) ? knownLive.videoId : null;
 
   if (knownVideoId) {
-    const verifiedVideoId = activeLiveVideoId(
-      [knownVideoId],
-      await videosById([knownVideoId], apiKey),
-      channel.channelId,
-    );
+    const knownVideos = await videosById([knownVideoId], apiKey);
+    const knownVideo = knownVideos.find((video) => video.id === knownVideoId);
+    const knownSnapshot = knownVideo
+      ? videoSnapshots([knownVideoId], knownVideos, channel.channelId).get(
+          knownVideoId,
+        )
+      : null;
 
-    if (verifiedVideoId) {
-      const result = await storeLiveResult(context, handle, verifiedVideoId);
-      logResult(context, "known-live-cache", result);
+    if (knownSnapshot?.state === "live") {
+      const previousSearchState = cachedSearchState(
+        await readCache(context, "searchState", channel.channelId),
+      );
+      await clearSearchState(
+        context,
+        channel.channelId,
+        (previousSearchState?.pendingCandidates || []).filter(
+          (entry) => entry.videoId !== knownVideoId,
+        ),
+      );
+      const result = await storeLiveResult(context, handle, knownVideoId);
+      logResult(context, "known-live-cache", result, {
+        candidateVideoId: knownVideoId,
+        channelId: channel.channelId,
+        liveCandidateFound: true,
+        searchAttempted: false,
+      });
       return result;
     }
 
+    const ownershipIsKnown =
+      !knownVideo || knownVideo.snippet?.channelId === channel.channelId;
+    const metadataIsUncertain =
+      !knownVideo ||
+      !knownSnapshot ||
+      ["unknown", "upcoming"].includes(knownSnapshot.state);
+
+    if (ownershipIsKnown && metadataIsUncertain) {
+      await retainSearchCandidatesForRetry(
+        context,
+        channel.channelId,
+        [knownVideoId],
+      );
+      // Transfer uncertain metadata to bounded pending retries once. Leaving
+      // this ID in known-live would renew its search deadline on every check.
+      // Write an invalidation marker so a failed delete cannot resurrect it.
+      await writeCache(
+        context,
+        "known-live",
+        handle,
+        { videoId: null },
+        CACHE_TTL.knownLive,
+      );
+      return resolveFromUploads(
+        context,
+        handle,
+        apiKey,
+        channel,
+        "known-live-uncertain-uploads",
+        {
+          nextSearchAt: null,
+          searchAttempted: false,
+          searchBackoffStage: null,
+          searchSkippedReason: "known-live-uncertain",
+        },
+        { skipSearchCandidateIds: [knownVideoId] },
+      );
+    }
+
+    await removeSearchCandidate(context, channel.channelId, knownVideoId);
     await deleteCache(context, "known-live", handle);
   }
 
@@ -1099,11 +2200,21 @@ async function resolveLiveVideo(context, handle, apiKey) {
       handle,
       apiKey,
       channel,
-      "search-disabled-uploads",
+      "search-quota-disabled-uploads",
+      {
+        nextSearchAt: null,
+        searchAttempted: false,
+        searchBackoffStage: null,
+        searchSkippedReason: "quota-disabled",
+      },
     );
   }
 
-  const searchTemporary = await activeCooldown(context, "searchTemporary");
+  const searchTemporary = await activeCooldown(
+    context,
+    "searchTemporary",
+    channel.channelId,
+  );
 
   if (searchTemporary) {
     return resolveFromUploads(
@@ -1111,19 +2222,33 @@ async function resolveLiveVideo(context, handle, apiKey) {
       handle,
       apiKey,
       channel,
-      "search-error-uploads",
+      "search-temporary-uploads",
+      {
+        nextSearchAt: null,
+        searchAttempted: false,
+        searchBackoffStage: null,
+        searchSkippedReason: "temporary-cooldown",
+      },
     );
   }
 
-  const searchMiss = await readCache(context, "searchMiss", handle);
+  const searchState = cachedSearchState(
+    await readCache(context, "searchState", channel.channelId),
+  );
 
-  if (searchMiss !== null) {
+  if (searchState && searchState.nextSearchAt > now) {
     return resolveFromUploads(
       context,
       handle,
       apiKey,
       channel,
-      "search-miss-uploads",
+      "search-backoff-uploads",
+      {
+        nextSearchAt: searchState.nextSearchAt,
+        searchAttempted: false,
+        searchBackoffStage: searchState.stage,
+        searchSkippedReason: "backoff",
+      },
     );
   }
 
@@ -1139,7 +2264,35 @@ async function resolveLiveVideo(context, handle, apiKey) {
       apiKey,
       channel,
       "search-client-throttled-uploads",
+      {
+        nextSearchAt: searchState?.nextSearchAt || null,
+        searchAttempted: false,
+        searchBackoffStage: searchState?.stage ?? null,
+        searchSkippedReason: "client-cooldown",
+      },
     );
+  }
+
+  const pendingSearchInspection = await inspectPendingSearchCandidates(
+    context,
+    channel,
+    apiKey,
+  );
+
+  if (pendingSearchInspection.candidateVideoId) {
+    const result = await storeLiveResult(
+      context,
+      handle,
+      pendingSearchInspection.candidateVideoId,
+    );
+    logResult(context, "pending-search-candidate", result, {
+      candidateVideoId: pendingSearchInspection.candidateVideoId,
+      channelId: channel.channelId,
+      liveCandidateFound: true,
+      searchAttempted: false,
+      videosVerified: pendingSearchInspection.videosVerified,
+    });
+    return result;
   }
 
   if (searchClient) {
@@ -1157,14 +2310,14 @@ async function resolveLiveVideo(context, handle, apiKey) {
   try {
     searchVideoIds = await searchLiveVideoIds(channel.channelId, apiKey);
   } catch (error) {
-    const quotaExceeded =
-      error?.stage === "search.list" && isDailyQuotaError(error);
+    const searchStage = isSearchListStage(error?.stage);
+    const quotaExceeded = searchStage && isDailyQuotaError(error);
 
     if (!quotaExceeded && searchClient) {
       await deleteCache(context, "searchClientCooldown", searchClient);
     }
 
-    if (error?.stage !== "search.list") {
+    if (!searchStage) {
       throw error;
     }
 
@@ -1190,15 +2343,17 @@ async function resolveLiveVideo(context, handle, apiKey) {
           retryAt: Date.now() + TEMPORARY_COOLDOWN_MS,
           stage: safeLogToken(error.stage) || "search.list",
           status: Number.isInteger(error.status) ? error.status : null,
-        });
+        }, channel.channelId);
 
     logWarningOnce(
       context,
-      `search-${cooldown.code}-${cooldown.reason || "unknown"}`,
+      `search-${channel.channelId}-${cooldown.code}-` +
+        `${cooldown.reason || "unknown"}`,
       quotaExceeded
         ? "[youtube-live] search.list quota exhausted; using uploads fallback."
         : "[youtube-live] search.list unavailable; using uploads fallback.",
       {
+        channelId: channel.channelId,
         reason: cooldown.reason,
         retryAt: cooldown.retryAt,
         stage: cooldown.stage,
@@ -1211,37 +2366,113 @@ async function resolveLiveVideo(context, handle, apiKey) {
       handle,
       apiKey,
       channel,
-      quotaExceeded ? "search-disabled-uploads" : "search-error-uploads",
+      quotaExceeded
+        ? "search-quota-disabled-uploads"
+        : "search-temporary-uploads",
+      {
+        nextSearchAt: searchState?.nextSearchAt || null,
+        searchAttempted: true,
+        searchBackoffStage: searchState?.stage ?? 0,
+        searchFailed: true,
+        searchSkippedReason: quotaExceeded
+          ? "quota-exhausted"
+          : "temporary-failure",
+      },
     );
   }
 
-  const searchVideoId = activeLiveVideoId(
-    searchVideoIds,
-    await videosById(searchVideoIds, apiKey),
-    channel.channelId,
-  );
+  let searchVideos;
 
-  if (searchVideoId) {
-    const result = await storeLiveResult(context, handle, searchVideoId);
+  try {
+    searchVideos = await videosById(searchVideoIds, apiKey);
+  } catch (error) {
+    if (isChannelDiscoveryStage(error?.stage) && searchVideoIds.length) {
+      await retainSearchCandidatesForRetry(
+        context,
+        channel.channelId,
+        searchVideoIds,
+        { advanceStage: true, searchAttempted: true },
+      );
+    }
+
+    throw error;
+  }
+
+  const latestSearchState = cachedSearchState(
+    await readCache(context, "searchState", channel.channelId),
+  );
+  let searchInspection;
+
+  try {
+    searchInspection = searchVideoIds.length
+      ? inspectSearchMetadata(
+          searchVideoIds,
+          searchVideos,
+          channel.channelId,
+          latestSearchState?.pendingCandidates || [],
+        )
+      : {
+          candidateVideoId: null,
+          pendingCandidates: latestSearchState?.pendingCandidates || [],
+          videosVerified: 0,
+        };
+  } catch (error) {
+    if (isChannelDiscoveryStage(error?.stage) && searchVideoIds.length) {
+      await retainSearchCandidatesForRetry(
+        context,
+        channel.channelId,
+        searchVideoIds,
+        { advanceStage: true, searchAttempted: true },
+      );
+    }
+
+    throw error;
+  }
+
+  if (searchInspection.candidateVideoId) {
+    await clearSearchState(
+      context,
+      channel.channelId,
+      searchInspection.pendingCandidates,
+    );
+    const result = await storeLiveResult(
+      context,
+      handle,
+      searchInspection.candidateVideoId,
+    );
     logResult(context, "search-list", result, {
+      channelId: channel.channelId,
+      candidateVideoId: searchInspection.candidateVideoId,
+      liveCandidateFound: true,
+      nextSearchAt: null,
+      searchAttempted: true,
+      searchBackoffStage: searchState?.stage ?? 0,
       searchCandidatesChecked: searchVideoIds.length,
+      videosVerified: searchVideos.length,
     });
     return result;
   }
 
-  await writeCache(
+  const nextSearchState = await storeSearchMiss(
     context,
-    "searchMiss",
-    handle,
-    { active: true },
-    CACHE_TTL.searchMiss,
+    channel.channelId,
+    searchInspection.pendingCandidates,
   );
   return resolveFromUploads(
     context,
     handle,
     apiKey,
     channel,
-    "search-miss-uploads",
+    "search-result-miss-uploads",
+    {
+      nextSearchAt: nextSearchState.nextSearchAt,
+      searchAttempted: true,
+      searchBackoffStage: nextSearchState.stage,
+      searchCandidatesChecked: searchVideoIds.length,
+      searchResult: "miss",
+      searchVideosVerified: searchVideos.length,
+    },
+    { skipSearchCandidateIds: searchVideoIds },
   );
 }
 
@@ -1269,7 +2500,13 @@ async function resolveWithFailureHandling(context, handle, apiKey) {
         CACHE_TTL.unavailable,
       );
       await Promise.all(
-        ["result", "offlineState", "known-live", "channel", "searchMiss"].map(
+        [
+          "result",
+          "offlineState",
+          "known-live",
+          "channel",
+          "channelTemporaryCooldown",
+        ].map(
           (kind) => deleteCache(context, kind, handle),
         ),
       );
@@ -1288,6 +2525,8 @@ async function resolveWithFailureHandling(context, handle, apiKey) {
     const reason = safeLogToken(error?.reason);
     let code = "youtube_upstream_unavailable";
     let retryAt = Date.now() + TEMPORARY_COOLDOWN_MS;
+    const channelScoped =
+      isTemporaryError(error) && isChannelDiscoveryStage(error?.stage);
 
     if (
       isDailyQuotaError(error) &&
@@ -1300,22 +2539,39 @@ async function resolveWithFailureHandling(context, handle, apiKey) {
       retryAt = Date.now() + CONFIGURATION_COOLDOWN_MS;
     }
 
-    const cooldown = await establishGeneralCooldown(context, {
-      code,
-      reason,
-      retryAt,
-      stage,
-      status,
-    });
+    const cooldown = channelScoped
+      ? await establishCooldown(
+          context,
+          "channelTemporaryCooldown",
+          {
+            code,
+            reason,
+            retryAt,
+            stage,
+            status,
+          },
+          handle,
+        )
+      : await establishGeneralCooldown(context, {
+          code,
+          reason,
+          retryAt,
+          stage,
+          status,
+        });
 
     logWarningOnce(
       context,
-      `general-${cooldown.code}-${cooldown.stage}-${cooldown.reason || "unknown"}`,
-      "[youtube-live] Discovery cooldown established.",
+      `${channelScoped ? "channel" : "general"}-${handle}-` +
+        `${cooldown.code}-${cooldown.stage}-${cooldown.reason || "unknown"}`,
+      channelScoped
+        ? "[youtube-live] Channel discovery cooldown established."
+        : "[youtube-live] Discovery cooldown established.",
       {
         code: cooldown.code,
         reason: cooldown.reason,
         retryAt: cooldown.retryAt,
+        scope: channelScoped ? "channel" : "global",
         stage: cooldown.stage,
         status: cooldown.status,
         temporary: isTemporaryError(error),
